@@ -1,0 +1,468 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Templates format="2" protocolVersion="83">
+  <Template revision="1.0" id="b5f39a7c-0d84-4e21-9c6f-2a71d8e35b40">
+    <SuggestedCCUParameters />
+    <RevisionHistory>
+      <Revision id="1.0">Initial version</Revision>
+    </RevisionHistory>
+    <Name>Shelly Power Strip 4 Gen4 MQTT</Name>
+    <CcuModel>PacketParserCCU</CcuModel>
+    <Producer>Shelly</Producer>
+    <Model>Shelly Power Strip 4 Gen4</Model>
+    <Description>Shelly Power Strip 4 Gen4 has four independently switched sockets, each with its own power metering. It uses the Gen2+ RPC MQTT API with JSON payloads, the same as the other Gen3/Gen4 devices.
+
+Device setup: open http://&lt;shellyIpAddress&gt; -&gt; Settings -&gt; Connectivity -&gt; MQTT. Enable MQTT, fill in "Server" as {MQTT broker IP}:{port} (and user/password if your broker requires them). Leave "Enable RPC over MQTT" ticked - that is how this template switches the sockets. Tick "RPC status notifications over MQTT" and "Generic status update over MQTT" so the device publishes both the events/rpc and status/... topics. Note that MQTT and the Shelly Cloud connection are mutually exclusive.
+
+"Power strip topic (MQTT prefix)" is the value of the "MQTT Prefix" field on that same page, entered exactly as configured and without a trailing slash. By default the device publishes at the root of the broker under its device ID, shellypstripg4-&lt;deviceid&gt; (12 hex characters, lower case), but the prefix can be changed to anything, including a multi-level one such as shellies/shellypstrip-livingroom. The device then publishes to &lt;topic&gt;/status/switch:0 .. switch:3, &lt;topic&gt;/events/rpc and &lt;topic&gt;/online, and accepts commands on &lt;topic&gt;/rpc.
+
+The module subscribes to &lt;topic&gt;/#, so it receives this device only, whatever prefix it uses. Incoming messages are additionally matched against the full prefix, so the root topic can safely be widened after import (for example to shellies/# when all your devices share that prefix) without other devices interfering.
+
+Sockets are numbered as in the Shelly app: Socket 1 is switch:0, Socket 4 is switch:3.</Description>
+    <ImportParameters>
+      <Parameter>
+        <Name>Mqtt Broker ${ipAddress}</Name>
+        <Value>10.0.6.2</Value>
+        <Id>IpAddress</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Mqtt Broker port</Name>
+        <Value>1883</Value>
+        <Id>Port</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Mqtt Broker user name</Name>
+        <Value></Value>
+        <Id>UserName</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Mqtt Broker password</Name>
+        <Value></Value>
+        <Id>Password</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Power strip topic (MQTT prefix)</Name>
+        <Value>shellypstripg4-123456789012</Value>
+        <Id>mID</Id>
+      </Parameter>
+    </ImportParameters>
+    <Module>
+      <Name>Shelly Power Strip 4 Gen4 MQTT</Name>
+      <Id>-1</Id>
+      <Model>PacketParserModuleMqtt</Model>
+      <DeviceProperties>
+        <ReadScriptPacketParser>IF isOnline = 0
+    ADDWARNING("Device is offline (MQTT LWT)");
+END
+
+# The device publishes only on change, and the status topics are not retained,
+# so after a start or a reconnect its current state is unknown. Ask for a full
+# snapshot until one arrives - the reply is published to &lt;topic&gt;/taphome/rpc,
+# which this module is subscribed to.
+IF gotStatus = 0
+    MQTTPUBLISH(plugTopic + "/rpc", "{\"id\":1,\"src\":\"" + plugTopic + "/taphome\",\"method\":\"Shelly.GetStatus\"}");
+END</ReadScriptPacketParser>
+        <InternalPollInterval>5000</InternalPollInterval>
+        <CustomVariables>[{"Name":"plugTopic","ValueTypeId":2,"NumericValue":0,"StringValue":"$[mID]"},{"Name":"internalTemp","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"isOnline","ValueTypeId":1,"NumericValue":1},{"Name":"gotStatus","ValueTypeId":1,"NumericValue":0}]</CustomVariables>
+        <ServiceAttributesScriptsPacketParser>[{"AttributeDefinition":{"Name":"${temperature} [°C]"},"ReadFormula":"internalTemp"}]</ServiceAttributesScriptsPacketParser>
+        <ServiceActionsScriptsPacketParser>[{"ActionDefinition":{"Name":"${xml_update_fw}","NumericParameters":[],"BoolParameters":[],"EnumParameters":[]},"Script":"MQTTPUBLISH(plugTopic + \"/rpc\", \"{\\\"id\\\":1,\\\"src\\\":\\\"taphome\\\",\\\"method\\\":\\\"Shelly.Update\\\",\\\"params\\\":{\\\"stage\\\":\\\"stable\\\"}}\");\r\nRETURN(\"OK\");"},{"ActionDefinition":{"Name":"Reboot","NumericParameters":[],"BoolParameters":[],"EnumParameters":[]},"Script":"MQTTPUBLISH(plugTopic + \"/rpc\", \"{\\\"id\\\":1,\\\"src\\\":\\\"taphome\\\",\\\"method\\\":\\\"Shelly.Reboot\\\"}\");\r\nRETURN(\"OK\");"}]</ServiceActionsScriptsPacketParser>
+        <ListenerScriptPacketParser>IF(plugTopic = "shellypstripg4-123456789012")
+    ADDERROR("Set correct 'plugTopic' value in module variables. It is the MQTT prefix from 'http://shellyIpAddress' -&gt; Settings -&gt; Connectivity -&gt; MQTT, by default 'shellypstripg4-&lt;deviceid&gt;'.");
+    RETURN(-1);
+END
+
+# Every topic is compared against the full prefix of this device, so the root
+# topic may safely be widened (e.g. to shellies/#) to cover several devices.
+
+# Device availability (MQTT last will). A reconnect invalidates the values that
+# were read so far, so a fresh status snapshot is requested afterwards.
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/online")
+    isOnline := IF(TOSTRING(RECEIVEDMSG.PAYLOAD) = "true", 1, 0);
+    IF(isOnline = 1, gotStatus := 0);
+END
+
+# Reply to the Shelly.GetStatus request sent from the module read script
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    gotStatus := 1;
+    VAR rt := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:0'].temperature.tC", TRUE);
+    IF(!ISNULL(rt), internalTemp := rt);
+END
+
+# All four sockets report the same internal device temperature, socket 1 is used.
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:0")
+    internalTemp := PARSEJSON(RECEIVEDMSG.PAYLOAD, "temperature.tC");
+
+    VAR errors := PARSEJSON(RECEIVEDMSG.PAYLOAD, "errors", TRUE);
+    IF (!ISNULL(errors))
+        VAR errCount := LENGTH(errors);
+        VAR i := 0;
+        VAR errorText := "";
+
+        WHILE i &lt; errCount
+            IF LENGTH(errorText)
+                errorText += ", ";
+            END
+            errorText := errorText + GETAT(errors, i);
+            i += 1;
+        LOOP
+
+        IF LENGTH(errorText)
+            ADDERROR(errorText);
+        END
+    END
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR t := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].temperature.tC", TRUE);
+    IF(!ISNULL(t), internalTemp := t);
+END</ListenerScriptPacketParser>
+        <IpAddress>$[IpAddress]</IpAddress>
+        <Port>$[Port]</Port>
+        <UserName>$[UserName]</UserName>
+        <Password>$[Password]</Password>
+        <RootTopic>$[mID]/#</RootTopic>
+      </DeviceProperties>
+      <Devices>
+        <Device>
+          <Name>Socket 1</Name>
+          <Model>PacketParserSwitch</Model>
+          <Id>-2</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:0")
+    St := IF(PARSEJSON(RECEIVEDMSG.PAYLOAD, "output"), 1, 0);
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR output := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].output", TRUE);
+    IF(!ISNULL(output), St := IF(output, 1, 0));
+END
+
+# Initial state from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR initial := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:0'].output", TRUE);
+    IF(!ISNULL(initial), St := IF(initial, 1, 0));
+END</ListenerScriptPacketParser>
+            <ShouldDoPeriodicWrite>False</ShouldDoPeriodicWrite>
+            <NegateState>False</NegateState>
+            <OnStateIconId>60</OnStateIconId>
+            <OffStateIconId>61</OffStateIconId>
+            <OnStateName>${general_on}</OnStateName>
+            <OffStateName>${general_off}</OffStateName>
+            <ReadSwitchStateScriptPacketParser></ReadSwitchStateScriptPacketParser>
+            <WriteSwitchStateScriptPacketParser># RPC over MQTT - enabled by default on Gen4 devices
+VAR rpc := "{\"id\":1,\"src\":\"taphome\",\"method\":\"Switch.Set\",\"params\":{\"id\":0,\"on\":" + IF(St = 1, "true", "false") + "}}";
+MQTTPUBLISH(plugTopic + "/rpc", rpc);
+
+# Alternative, only works when Settings -&gt; MQTT -&gt; "Enable MQTT Control" is ticked:
+# MQTTPUBLISH(plugTopic + "/command/switch:0", IF(St = 1, "on", "off"));</WriteSwitchStateScriptPacketParser>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>Socket 2</Name>
+          <Model>PacketParserSwitch</Model>
+          <Id>-3</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:1")
+    St := IF(PARSEJSON(RECEIVEDMSG.PAYLOAD, "output"), 1, 0);
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR output := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:1'].output", TRUE);
+    IF(!ISNULL(output), St := IF(output, 1, 0));
+END
+
+# Initial state from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR initial := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:1'].output", TRUE);
+    IF(!ISNULL(initial), St := IF(initial, 1, 0));
+END</ListenerScriptPacketParser>
+            <ShouldDoPeriodicWrite>False</ShouldDoPeriodicWrite>
+            <NegateState>False</NegateState>
+            <OnStateIconId>60</OnStateIconId>
+            <OffStateIconId>61</OffStateIconId>
+            <OnStateName>${general_on}</OnStateName>
+            <OffStateName>${general_off}</OffStateName>
+            <ReadSwitchStateScriptPacketParser></ReadSwitchStateScriptPacketParser>
+            <WriteSwitchStateScriptPacketParser># RPC over MQTT - enabled by default on Gen4 devices
+VAR rpc := "{\"id\":1,\"src\":\"taphome\",\"method\":\"Switch.Set\",\"params\":{\"id\":1,\"on\":" + IF(St = 1, "true", "false") + "}}";
+MQTTPUBLISH(plugTopic + "/rpc", rpc);
+
+# Alternative, only works when Settings -&gt; MQTT -&gt; "Enable MQTT Control" is ticked:
+# MQTTPUBLISH(plugTopic + "/command/switch:1", IF(St = 1, "on", "off"));</WriteSwitchStateScriptPacketParser>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>Socket 3</Name>
+          <Model>PacketParserSwitch</Model>
+          <Id>-4</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:2")
+    St := IF(PARSEJSON(RECEIVEDMSG.PAYLOAD, "output"), 1, 0);
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR output := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:2'].output", TRUE);
+    IF(!ISNULL(output), St := IF(output, 1, 0));
+END
+
+# Initial state from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR initial := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:2'].output", TRUE);
+    IF(!ISNULL(initial), St := IF(initial, 1, 0));
+END</ListenerScriptPacketParser>
+            <ShouldDoPeriodicWrite>False</ShouldDoPeriodicWrite>
+            <NegateState>False</NegateState>
+            <OnStateIconId>60</OnStateIconId>
+            <OffStateIconId>61</OffStateIconId>
+            <OnStateName>${general_on}</OnStateName>
+            <OffStateName>${general_off}</OffStateName>
+            <ReadSwitchStateScriptPacketParser></ReadSwitchStateScriptPacketParser>
+            <WriteSwitchStateScriptPacketParser># RPC over MQTT - enabled by default on Gen4 devices
+VAR rpc := "{\"id\":1,\"src\":\"taphome\",\"method\":\"Switch.Set\",\"params\":{\"id\":2,\"on\":" + IF(St = 1, "true", "false") + "}}";
+MQTTPUBLISH(plugTopic + "/rpc", rpc);
+
+# Alternative, only works when Settings -&gt; MQTT -&gt; "Enable MQTT Control" is ticked:
+# MQTTPUBLISH(plugTopic + "/command/switch:2", IF(St = 1, "on", "off"));</WriteSwitchStateScriptPacketParser>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>Socket 4</Name>
+          <Model>PacketParserSwitch</Model>
+          <Id>-5</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:3")
+    St := IF(PARSEJSON(RECEIVEDMSG.PAYLOAD, "output"), 1, 0);
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR output := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:3'].output", TRUE);
+    IF(!ISNULL(output), St := IF(output, 1, 0));
+END
+
+# Initial state from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR initial := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:3'].output", TRUE);
+    IF(!ISNULL(initial), St := IF(initial, 1, 0));
+END</ListenerScriptPacketParser>
+            <ShouldDoPeriodicWrite>False</ShouldDoPeriodicWrite>
+            <NegateState>False</NegateState>
+            <OnStateIconId>60</OnStateIconId>
+            <OffStateIconId>61</OffStateIconId>
+            <OnStateName>${general_on}</OnStateName>
+            <OffStateName>${general_off}</OffStateName>
+            <ReadSwitchStateScriptPacketParser></ReadSwitchStateScriptPacketParser>
+            <WriteSwitchStateScriptPacketParser># RPC over MQTT - enabled by default on Gen4 devices
+VAR rpc := "{\"id\":1,\"src\":\"taphome\",\"method\":\"Switch.Set\",\"params\":{\"id\":3,\"on\":" + IF(St = 1, "true", "false") + "}}";
+MQTTPUBLISH(plugTopic + "/rpc", rpc);
+
+# Alternative, only works when Settings -&gt; MQTT -&gt; "Enable MQTT Control" is ticked:
+# MQTTPUBLISH(plugTopic + "/command/switch:3", IF(St = 1, "on", "off"));</WriteSwitchStateScriptPacketParser>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>Socket 1 ${dashboard_deviceElectricityMeter}</Name>
+          <Model>PacketParserElectricityMeter</Model>
+          <Id>-6</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[{"Name":"voltage","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"current","ValueTypeId":1,"NumericValue":"NaN"}]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[{"AttributeDefinition":{"Name":"${electric_voltage} [V]"},"ReadFormula":"voltage"},{"AttributeDefinition":{"Name":"${electric_current} [A]"},"ReadFormula":"current"}]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:0")
+    Ed := PARSEJSON(RECEIVEDMSG.PAYLOAD, "apower") / 1000.0;
+    To := PARSEJSON(RECEIVEDMSG.PAYLOAD, "aenergy.total") / 1000.0;
+    voltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "voltage");
+    current := PARSEJSON(RECEIVEDMSG.PAYLOAD, "current");
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR apower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].apower", TRUE);
+    IF(!ISNULL(apower), Ed := apower / 1000.0);
+    VAR total := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].aenergy.total", TRUE);
+    IF(!ISNULL(total), To := total / 1000.0);
+    VAR v := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].voltage", TRUE);
+    IF(!ISNULL(v), voltage := v);
+    VAR a := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].current", TRUE);
+    IF(!ISNULL(a), current := a);
+END
+
+# Initial values from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR iPower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:0'].apower", TRUE);
+    IF(!ISNULL(iPower), Ed := iPower / 1000.0);
+    VAR iTotal := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:0'].aenergy.total", TRUE);
+    IF(!ISNULL(iTotal), To := iTotal / 1000.0);
+    VAR iVoltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:0'].voltage", TRUE);
+    IF(!ISNULL(iVoltage), voltage := iVoltage);
+    VAR iCurrent := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:0'].current", TRUE);
+    IF(!ISNULL(iCurrent), current := iCurrent);
+END</ListenerScriptPacketParser>
+            <ReadTotalConsumptionScriptPacketParser></ReadTotalConsumptionScriptPacketParser>
+            <ReadDemandScriptPacketParser></ReadDemandScriptPacketParser>
+            <Calibration>0</Calibration>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>Socket 2 ${dashboard_deviceElectricityMeter}</Name>
+          <Model>PacketParserElectricityMeter</Model>
+          <Id>-7</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[{"Name":"voltage","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"current","ValueTypeId":1,"NumericValue":"NaN"}]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[{"AttributeDefinition":{"Name":"${electric_voltage} [V]"},"ReadFormula":"voltage"},{"AttributeDefinition":{"Name":"${electric_current} [A]"},"ReadFormula":"current"}]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:1")
+    Ed := PARSEJSON(RECEIVEDMSG.PAYLOAD, "apower") / 1000.0;
+    To := PARSEJSON(RECEIVEDMSG.PAYLOAD, "aenergy.total") / 1000.0;
+    voltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "voltage");
+    current := PARSEJSON(RECEIVEDMSG.PAYLOAD, "current");
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR apower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:1'].apower", TRUE);
+    IF(!ISNULL(apower), Ed := apower / 1000.0);
+    VAR total := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:1'].aenergy.total", TRUE);
+    IF(!ISNULL(total), To := total / 1000.0);
+    VAR v := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:1'].voltage", TRUE);
+    IF(!ISNULL(v), voltage := v);
+    VAR a := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:1'].current", TRUE);
+    IF(!ISNULL(a), current := a);
+END
+
+# Initial values from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR iPower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:1'].apower", TRUE);
+    IF(!ISNULL(iPower), Ed := iPower / 1000.0);
+    VAR iTotal := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:1'].aenergy.total", TRUE);
+    IF(!ISNULL(iTotal), To := iTotal / 1000.0);
+    VAR iVoltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:1'].voltage", TRUE);
+    IF(!ISNULL(iVoltage), voltage := iVoltage);
+    VAR iCurrent := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:1'].current", TRUE);
+    IF(!ISNULL(iCurrent), current := iCurrent);
+END</ListenerScriptPacketParser>
+            <ReadTotalConsumptionScriptPacketParser></ReadTotalConsumptionScriptPacketParser>
+            <ReadDemandScriptPacketParser></ReadDemandScriptPacketParser>
+            <Calibration>0</Calibration>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>Socket 3 ${dashboard_deviceElectricityMeter}</Name>
+          <Model>PacketParserElectricityMeter</Model>
+          <Id>-8</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[{"Name":"voltage","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"current","ValueTypeId":1,"NumericValue":"NaN"}]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[{"AttributeDefinition":{"Name":"${electric_voltage} [V]"},"ReadFormula":"voltage"},{"AttributeDefinition":{"Name":"${electric_current} [A]"},"ReadFormula":"current"}]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:2")
+    Ed := PARSEJSON(RECEIVEDMSG.PAYLOAD, "apower") / 1000.0;
+    To := PARSEJSON(RECEIVEDMSG.PAYLOAD, "aenergy.total") / 1000.0;
+    voltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "voltage");
+    current := PARSEJSON(RECEIVEDMSG.PAYLOAD, "current");
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR apower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:2'].apower", TRUE);
+    IF(!ISNULL(apower), Ed := apower / 1000.0);
+    VAR total := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:2'].aenergy.total", TRUE);
+    IF(!ISNULL(total), To := total / 1000.0);
+    VAR v := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:2'].voltage", TRUE);
+    IF(!ISNULL(v), voltage := v);
+    VAR a := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:2'].current", TRUE);
+    IF(!ISNULL(a), current := a);
+END
+
+# Initial values from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR iPower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:2'].apower", TRUE);
+    IF(!ISNULL(iPower), Ed := iPower / 1000.0);
+    VAR iTotal := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:2'].aenergy.total", TRUE);
+    IF(!ISNULL(iTotal), To := iTotal / 1000.0);
+    VAR iVoltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:2'].voltage", TRUE);
+    IF(!ISNULL(iVoltage), voltage := iVoltage);
+    VAR iCurrent := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:2'].current", TRUE);
+    IF(!ISNULL(iCurrent), current := iCurrent);
+END</ListenerScriptPacketParser>
+            <ReadTotalConsumptionScriptPacketParser></ReadTotalConsumptionScriptPacketParser>
+            <ReadDemandScriptPacketParser></ReadDemandScriptPacketParser>
+            <Calibration>0</Calibration>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>Socket 4 ${dashboard_deviceElectricityMeter}</Name>
+          <Model>PacketParserElectricityMeter</Model>
+          <Id>-9</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[{"Name":"voltage","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"current","ValueTypeId":1,"NumericValue":"NaN"}]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[{"AttributeDefinition":{"Name":"${electric_voltage} [V]"},"ReadFormula":"voltage"},{"AttributeDefinition":{"Name":"${electric_current} [A]"},"ReadFormula":"current"}]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:3")
+    Ed := PARSEJSON(RECEIVEDMSG.PAYLOAD, "apower") / 1000.0;
+    To := PARSEJSON(RECEIVEDMSG.PAYLOAD, "aenergy.total") / 1000.0;
+    voltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "voltage");
+    current := PARSEJSON(RECEIVEDMSG.PAYLOAD, "current");
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR apower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:3'].apower", TRUE);
+    IF(!ISNULL(apower), Ed := apower / 1000.0);
+    VAR total := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:3'].aenergy.total", TRUE);
+    IF(!ISNULL(total), To := total / 1000.0);
+    VAR v := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:3'].voltage", TRUE);
+    IF(!ISNULL(v), voltage := v);
+    VAR a := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:3'].current", TRUE);
+    IF(!ISNULL(a), current := a);
+END
+
+# Initial values from the Shelly.GetStatus reply requested by the module
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/taphome/rpc")
+    VAR iPower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:3'].apower", TRUE);
+    IF(!ISNULL(iPower), Ed := iPower / 1000.0);
+    VAR iTotal := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:3'].aenergy.total", TRUE);
+    IF(!ISNULL(iTotal), To := iTotal / 1000.0);
+    VAR iVoltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:3'].voltage", TRUE);
+    IF(!ISNULL(iVoltage), voltage := iVoltage);
+    VAR iCurrent := PARSEJSON(RECEIVEDMSG.PAYLOAD, "result['switch:3'].current", TRUE);
+    IF(!ISNULL(iCurrent), current := iCurrent);
+END</ListenerScriptPacketParser>
+            <ReadTotalConsumptionScriptPacketParser></ReadTotalConsumptionScriptPacketParser>
+            <ReadDemandScriptPacketParser></ReadDemandScriptPacketParser>
+            <Calibration>0</Calibration>
+          </DeviceProperties>
+        </Device>
+      </Devices>
+    </Module>
+  </Template>
+</Templates>
