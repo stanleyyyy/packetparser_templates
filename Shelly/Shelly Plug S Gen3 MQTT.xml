@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Templates format="2" protocolVersion="83">
+  <Template revision="1.0" id="7c1e4d2a-9b63-4f18-a5d0-3e6b2f8c41ab">
+    <SuggestedCCUParameters />
+    <RevisionHistory>
+      <Revision id="1.0">Initial version</Revision>
+    </RevisionHistory>
+    <Name>Shelly Plug S Gen3 MQTT</Name>
+    <CcuModel>PacketParserCCU</CcuModel>
+    <Producer>Shelly</Producer>
+    <Model>Shelly Plug S Gen3</Model>
+    <Description>Shelly Plug S Gen3 uses the Gen2+ RPC MQTT API (JSON payloads), not the Gen1 "shellies/&lt;id&gt;/relay/0" plain-text topics.
+
+Device setup: open http://&lt;shellyIpAddress&gt; -&gt; Settings -&gt; Connectivity -&gt; MQTT. Enable MQTT, fill in "Server" as {MQTT broker IP}:{port} (and user/password if your broker requires them). Leave "Enable RPC over MQTT" ticked - that is how this template switches the output. Tick "RPC status notifications over MQTT" and "Generic status update over MQTT" so the device publishes both the events/rpc and status/... topics. Note that MQTT and the Shelly Cloud connection are mutually exclusive.
+
+"Plug topic (MQTT prefix)" is the value of the "MQTT Prefix" field on that same page, entered exactly as configured and without a trailing slash. Set it to shellies/&lt;your device name&gt;, for example shellies/shellyplug-s-kitchen. The device then publishes to &lt;plug topic&gt;/status/switch:0, &lt;plug topic&gt;/events/rpc and &lt;plug topic&gt;/online, and accepts commands on &lt;plug topic&gt;/rpc.
+
+The module subscribes to the root topic shellies/#, so all Shelly devices sharing that prefix arrive on one subscription; every message is then matched against the plug topic above, and other devices are ignored. If the plug uses the factory prefix (the device ID, shellyplugsg3-&lt;deviceid&gt;) instead of a shellies/ one, either change the prefix in the device to shellies/&lt;name&gt;, or after import change the module's Root topic to &lt;plug topic&gt;/#.</Description>
+    <ImportParameters>
+      <Parameter>
+        <Name>Mqtt Broker ${ipAddress}</Name>
+        <Value>10.0.6.2</Value>
+        <Id>IpAddress</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Mqtt Broker port</Name>
+        <Value>1883</Value>
+        <Id>Port</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Mqtt Broker user name</Name>
+        <Value></Value>
+        <Id>UserName</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Mqtt Broker password</Name>
+        <Value></Value>
+        <Id>Password</Id>
+      </Parameter>
+      <Parameter>
+        <Name>Plug topic (MQTT prefix)</Name>
+        <Value>shellies/shellyplug-s-gen3</Value>
+        <Id>mID</Id>
+      </Parameter>
+    </ImportParameters>
+    <Module>
+      <Name>Shelly Plug S Gen3 MQTT</Name>
+      <Id>-1</Id>
+      <Model>PacketParserModuleMqtt</Model>
+      <DeviceProperties>
+        <ReadScriptPacketParser>IF isOnline = 0
+    ADDWARNING("Device is offline (MQTT LWT)");
+END</ReadScriptPacketParser>
+        <InternalPollInterval>5000</InternalPollInterval>
+        <CustomVariables>[{"Name":"plugTopic","ValueTypeId":2,"NumericValue":0,"StringValue":"$[mID]"},{"Name":"internalTemp","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"voltage","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"current","ValueTypeId":1,"NumericValue":"NaN"},{"Name":"isOnline","ValueTypeId":1,"NumericValue":1}]</CustomVariables>
+        <ServiceAttributesScriptsPacketParser>[{"AttributeDefinition":{"Name":"${temperature} [°C]"},"ReadFormula":"internalTemp"},{"AttributeDefinition":{"Name":"${electric_voltage} [V]"},"ReadFormula":"voltage"},{"AttributeDefinition":{"Name":"${electric_current} [A]"},"ReadFormula":"current"}]</ServiceAttributesScriptsPacketParser>
+        <ServiceActionsScriptsPacketParser>[{"ActionDefinition":{"Name":"${xml_update_fw}","NumericParameters":[],"BoolParameters":[],"EnumParameters":[]},"Script":"MQTTPUBLISH(plugTopic + \"/rpc\", \"{\\\"id\\\":1,\\\"src\\\":\\\"taphome\\\",\\\"method\\\":\\\"Shelly.Update\\\",\\\"params\\\":{\\\"stage\\\":\\\"stable\\\"}}\");\r\nRETURN(\"OK\");"},{"ActionDefinition":{"Name":"Reboot","NumericParameters":[],"BoolParameters":[],"EnumParameters":[]},"Script":"MQTTPUBLISH(plugTopic + \"/rpc\", \"{\\\"id\\\":1,\\\"src\\\":\\\"taphome\\\",\\\"method\\\":\\\"Shelly.Reboot\\\"}\");\r\nRETURN(\"OK\");"}]</ServiceActionsScriptsPacketParser>
+        <ListenerScriptPacketParser>IF(plugTopic = "shellies/shellyplug-s-gen3")
+    ADDERROR("Set correct 'plugTopic' value in module variables. It is the MQTT prefix from 'http://shellyIpAddress' -&gt; Settings -&gt; Connectivity -&gt; MQTT, by default 'shellyplugsg3-&lt;deviceid&gt;', but it may be a custom multi-level prefix such as 'shellies/shellyplug-s-kitchen'.");
+    RETURN(-1);
+END
+
+# The root topic may cover several devices (e.g. shellies/#), so every topic is
+# compared against the full prefix of this device - other Shellys are ignored.
+
+# Device availability (MQTT last will)
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/online")
+    isOnline := IF(TOSTRING(RECEIVEDMSG.PAYLOAD) = "true", 1, 0);
+END
+
+# Full status snapshot - published when "Generic status update over MQTT" is enabled
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:0")
+    internalTemp := PARSEJSON(RECEIVEDMSG.PAYLOAD, "temperature.tC");
+    voltage := PARSEJSON(RECEIVEDMSG.PAYLOAD, "voltage");
+    current := PARSEJSON(RECEIVEDMSG.PAYLOAD, "current");
+
+    VAR errors := PARSEJSON(RECEIVEDMSG.PAYLOAD, "errors", TRUE);
+    IF (!ISNULL(errors))
+        VAR errCount := LENGTH(errors);
+        VAR i := 0;
+        VAR errorText := "";
+
+        WHILE i &lt; errCount
+            IF LENGTH(errorText)
+                errorText += ", ";
+            END
+            errorText := errorText + GETAT(errors, i);
+            i += 1;
+        LOOP
+
+        IF LENGTH(errorText)
+            ADDERROR(errorText);
+        END
+    END
+END
+
+# Incremental RPC notifications (NotifyStatus / NotifyFullStatus) - only changed keys are present
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR t := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].temperature.tC", TRUE);
+    IF(!ISNULL(t), internalTemp := t);
+    VAR v := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].voltage", TRUE);
+    IF(!ISNULL(v), voltage := v);
+    VAR a := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].current", TRUE);
+    IF(!ISNULL(a), current := a);
+END</ListenerScriptPacketParser>
+        <IpAddress>$[IpAddress]</IpAddress>
+        <Port>$[Port]</Port>
+        <UserName>$[UserName]</UserName>
+        <Password>$[Password]</Password>
+        <RootTopic>shellies/#</RootTopic>
+      </DeviceProperties>
+      <Devices>
+        <Device>
+          <Name>${digital_output}</Name>
+          <Model>PacketParserSwitch</Model>
+          <Id>-2</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:0")
+    St := IF(PARSEJSON(RECEIVEDMSG.PAYLOAD, "output"), 1, 0);
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR output := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].output", TRUE);
+    IF(!ISNULL(output), St := IF(output, 1, 0));
+END</ListenerScriptPacketParser>
+            <ShouldDoPeriodicWrite>False</ShouldDoPeriodicWrite>
+            <NegateState>False</NegateState>
+            <OnStateIconId>60</OnStateIconId>
+            <OffStateIconId>61</OffStateIconId>
+            <OnStateName>${general_on}</OnStateName>
+            <OffStateName>${general_off}</OffStateName>
+            <ReadSwitchStateScriptPacketParser></ReadSwitchStateScriptPacketParser>
+            <WriteSwitchStateScriptPacketParser># RPC over MQTT - enabled by default on Gen3 devices
+VAR rpc := "{\"id\":1,\"src\":\"taphome\",\"method\":\"Switch.Set\",\"params\":{\"id\":0,\"on\":" + IF(St = 1, "true", "false") + "}}";
+MQTTPUBLISH(plugTopic + "/rpc", rpc);
+
+# Alternative, only works when Settings -&gt; MQTT -&gt; "Enable MQTT Control" is ticked:
+# MQTTPUBLISH(plugTopic + "/command/switch:0", IF(St = 1, "on", "off"));</WriteSwitchStateScriptPacketParser>
+          </DeviceProperties>
+        </Device>
+        <Device>
+          <Name>${dashboard_deviceElectricityMeter}</Name>
+          <Model>PacketParserElectricityMeter</Model>
+          <Id>-3</Id>
+          <DeviceProperties>
+            <DeviceType>0</DeviceType>
+            <ReadScriptPacketParser></ReadScriptPacketParser>
+            <InternalPollInterval>15000</InternalPollInterval>
+            <CustomVariables>[]</CustomVariables>
+            <ServiceAttributesScriptsPacketParser>[]</ServiceAttributesScriptsPacketParser>
+            <ServiceActionsScriptsPacketParser>[]</ServiceActionsScriptsPacketParser>
+            <ListenerScriptPacketParser>IF(RECEIVEDMSG.TOPIC = plugTopic + "/status/switch:0")
+    Ed := PARSEJSON(RECEIVEDMSG.PAYLOAD, "apower") / 1000.0;
+    To := PARSEJSON(RECEIVEDMSG.PAYLOAD, "aenergy.total") / 1000.0;
+END
+
+IF(RECEIVEDMSG.TOPIC = plugTopic + "/events/rpc")
+    VAR apower := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].apower", TRUE);
+    IF(!ISNULL(apower), Ed := apower / 1000.0);
+    VAR total := PARSEJSON(RECEIVEDMSG.PAYLOAD, "params['switch:0'].aenergy.total", TRUE);
+    IF(!ISNULL(total), To := total / 1000.0);
+END</ListenerScriptPacketParser>
+            <ReadTotalConsumptionScriptPacketParser></ReadTotalConsumptionScriptPacketParser>
+            <ReadDemandScriptPacketParser></ReadDemandScriptPacketParser>
+            <Calibration>0</Calibration>
+          </DeviceProperties>
+        </Device>
+      </Devices>
+    </Module>
+  </Template>
+</Templates>
